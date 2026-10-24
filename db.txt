@@ -1,0 +1,214 @@
+1. Multi-Entity & Time Period Tracking
+-- Companies / Legal Entities
+CREATE TABLE companies (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    legal_name VARCHAR(255) NOT NULL,
+    tax_identifier VARCHAR(100) NOT NULL, -- e.g., VAT ID, EIN
+    base_currency_code CHAR(3) NOT NULL,  -- ISO 4217 (e.g., USD, EUR, JPY)
+    country_code CHAR(2) NOT NULL,        -- ISO 3166-1 alpha-2
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Fiscal Years (IAS 1 reporting windows)
+CREATE TABLE fiscal_years (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL REFERENCES companies(id),
+    name VARCHAR(50) NOT NULL,            -- e.g., "FY 2026"
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    is_closed BOOLEAN DEFAULT FALSE       -- Prevents posting in closed years
+);
+
+-- Accounting Periods (Monthly/Quarterly sub-periods)
+CREATE TABLE accounting_periods (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    fiscal_year_id UUID NOT NULL REFERENCES fiscal_years(id),
+    period_number INT NOT NULL,            -- e.g., 1 to 12
+    start_date DATE NOT NULL,
+    end_date DATE NOT NULL,
+    is_closed BOOLEAN DEFAULT FALSE       -- Hard lock on monthly posting
+);
+2. Chart of Accounts (CoA) & Master Data
+-- Chart of Accounts (Supports hierarchical structures)
+CREATE TABLE accounts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL REFERENCES companies(id),
+    code VARCHAR(50) NOT NULL,            -- Standard Account Code (e.g., 1010)
+    name VARCHAR(255) NOT NULL,
+    parent_account_id UUID REFERENCES accounts(id), -- Hierarchical aggregation
+    account_type VARCHAR(50) NOT NULL,   -- ASSET, LIABILITY, EQUITY, REVENUE, EXPENSE
+    normal_balance VARCHAR(10) NOT NULL,  -- DEBIT or CREDIT
+    is_active BOOLEAN DEFAULT TRUE,
+    CONSTRAINT idx_company_account_code UNIQUE (company_id, code)
+);
+
+-- Counterparties (Customers, Vendors, Employees for Sub-ledgers)
+CREATE TABLE parties (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL REFERENCES companies(id),
+    party_type VARCHAR(20) NOT NULL,      -- CUSTOMER, VENDOR, BOTH
+    legal_name VARCHAR(255) NOT NULL,
+    tax_number VARCHAR(100),
+    country_code CHAR(2) NOT NULL,
+    currency_code CHAR(3) NOT NULL
+);
+
+-- Tax Engine / Rates (VAT, GST, Sales Tax)
+CREATE TABLE tax_rates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL REFERENCES companies(id),
+    code VARCHAR(50) NOT NULL,            -- e.g., VAT_20, GST_18
+    rate DECIMAL(5,4) NOT NULL,           -- e.g., 0.2000 for 20%
+    tax_account_id UUID REFERENCES accounts(id),
+    is_active BOOLEAN DEFAULT TRUE
+);
+3. Core General Ledger (Double-Entry Engine)
+-- Journal Entry Header (The Transaction Event)
+CREATE TABLE journal_entries (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL REFERENCES companies(id),
+    period_id UUID NOT NULL REFERENCES accounting_periods(id),
+    entry_number VARCHAR(100) NOT NULL,   -- Sequential audit identifier
+    posting_date DATE NOT NULL,
+    document_date DATE NOT NULL,
+    source_document_type VARCHAR(50),     -- INVOICE, PAYMENT, MANUAL, REVALUATION
+    source_document_id UUID,
+    status VARCHAR(20) DEFAULT 'POSTED',  -- DRAFT, POSTED, VOIDED
+    description TEXT,
+    created_by_user_id UUID NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT idx_company_entry_num UNIQUE (company_id, entry_number)
+);
+
+-- Journal Lines (Line-level Debits and Credits)
+CREATE TABLE journal_lines (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entry_id UUID NOT NULL REFERENCES journal_entries(id) ON DELETE RESTRICT,
+    account_id UUID NOT NULL REFERENCES accounts(id),
+    party_id UUID REFERENCES parties(id),       -- Links sub-ledger entity
+    tax_rate_id UUID REFERENCES tax_rates(id),  -- Links statutory tax tracking
+    
+    -- Transaction / Document Currency (e.g., EUR)
+    txn_currency_code CHAR(3) NOT NULL,
+    txn_debit DECIMAL(18, 4) DEFAULT 0.0000,
+    txn_credit DECIMAL(18, 4) DEFAULT 0.0000,
+    
+    -- Base / Functional Currency (e.g., USD)
+    fx_rate DECIMAL(12, 6) DEFAULT 1.000000,     -- Currency conversion factor
+    base_debit DECIMAL(18, 4) DEFAULT 0.0000,
+    base_credit DECIMAL(18, 4) DEFAULT 0.0000,
+    
+    line_description VARCHAR(255)
+);
+4. Audit Trail & Legal Traceability
+-- System-level immutable audit log (SOX 404 / GDPR requirement)
+CREATE TABLE audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    company_id UUID NOT NULL REFERENCES companies(id),
+    user_id UUID NOT NULL,
+    action_type VARCHAR(50) NOT NULL,     -- POST_JOURNAL, CLOSE_PERIOD, REVERSE_ENTRY
+    table_name VARCHAR(50) NOT NULL,
+    record_id UUID NOT NULL,
+    previous_state JSONB,
+    new_state JSONB,
+    ip_address VARCHAR(45),
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+1. Master Users Table
+This table stores core identities, system flags, and security controls (like MFA and lockout states).
+
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Identity Info
+    email VARCHAR(255) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,    -- Argon2id or bcrypt hash
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    job_title VARCHAR(100),
+    department VARCHAR(100),
+    
+    -- System Status & Access Flags
+    status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE', -- ACTIVE, SUSPENDED, DEACTIVATED
+    is_super_admin BOOLEAN DEFAULT FALSE,         -- System-wide admin bypass
+    
+    -- MFA & Security Compliance
+    mfa_enabled BOOLEAN DEFAULT FALSE,
+    mfa_secret VARCHAR(255),                      -- Encrypted TOTP secret
+    failed_login_attempts INT DEFAULT 0,
+    locked_until TIMESTAMP WITH TIME ZONE,
+    password_changed_at TIMESTAMP WITH TIME ZONE,
+    
+    -- Localization Default Settings
+    preferred_language VARCHAR(10) DEFAULT 'en',  -- ISO 639-1
+    timezone VARCHAR(50) DEFAULT 'UTC',           -- e.g., 'America/New_York'
+    
+    -- Audit Metadata
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    last_login_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_status ON users(status);
+
+2. Multi-Entity Access Control (Scoping)
+In an international context, a user may belong to one legal entity or multiple branches, each with a different assigned role (e.g., Accountant in US Entity, but Auditor in UK Entity).
+CREATE TABLE roles (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(50) NOT NULL UNIQUE,             -- e.g., "AP Manager", "GL Accountant", "External Auditor"
+    description VARCHAR(255),
+    is_system_role BOOLEAN DEFAULT FALSE,        -- Protects built-in system roles from deletion
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE user_company_access (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    role_id UUID NOT NULL REFERENCES roles(id),
+    
+    -- Segregation of Duties & Approval Limits (SOX Controls)
+    max_approval_limit DECIMAL(18, 4) DEFAULT 0.0000, -- Maximum amount user can approve in base currency
+    can_post_journals BOOLEAN DEFAULT FALSE,
+    
+    granted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    granted_by_user_id UUID REFERENCES users(id),
+    
+    CONSTRAINT idx_user_company_role UNIQUE (user_id, company_id, role_id)
+);
+
+3. Granular Fine-Grained Permissions
+Roles link to specific system actions (e.g., journal:create, period:close, vat_report:export).
+
+CREATE TABLE permissions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code VARCHAR(100) NOT NULL UNIQUE,            -- e.g., "journal_entry:post", "audit_log:view"
+    module VARCHAR(50) NOT NULL,                 -- e.g., "GL", "AP", "AR", "TAX", "ADMIN"
+    description VARCHAR(255)
+);
+
+CREATE TABLE role_permissions (
+    role_id UUID NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    permission_id UUID NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
+    PRIMARY KEY (role_id, permission_id)
+);
+
+4. Active User Sessions Table
+For compliance (SOX, ISO 27001), active sessions must be tracked to support forced logouts and remote session invalidation.
+
+CREATE TABLE user_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_token_hash VARCHAR(255) NOT NULL UNIQUE,
+    ip_address VARCHAR(45) NOT NULL,
+    user_agent TEXT,
+    expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX idx_sessions_user_token ON user_sessions(user_id, session_token_hash);
+
+
+Standard Pre-configured Roles & PrivilegesRole NameScope / PurposeCommon PermissionsCFO / ControllerGlobal Financial OversightFull Read, Period Closure, Final ApprovalsAP ClerkAccounts PayableCreate Invoices, Enter Bills, Pay VendorsAR SpecialistAccounts ReceivableSend Invoices, Record Payments, Debt CollectionGL AccountantGeneral Ledger OperationsDraft & Post Journal Entries, AccrualsTax SpecialistTax & Regulatory ComplianceStatutory Reports (SAF-T, VAT/GST Returns)External AuditorRead-Only InspectionView Ledgers, Export Audit Logs (No Edit Access)
